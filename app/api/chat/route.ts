@@ -1,0 +1,167 @@
+import { NextResponse } from 'next/server';
+import { askGemini, GeminiImageContent, GeminiMessage } from '../../../services/geminiService';
+import {
+  getConversationHistoryForAI,
+  validateConversationOwnership,
+  getOrCreateLatestConversation,
+  addMessageToConversation,
+  setConversationTitleIfMissing,
+} from '@/lib/conversationDb';
+import { AIRequestGatewayError, authenticateAIRequest, enforceAIGatewayRateLimit, executeAIRequest, getClientIp, buildAIRequestId } from '../../../lib/aiSecurityGateway';
+import { validateImageBuffer } from '../../../lib/imageValidator';
+import logger from '../../../lib/logger';
+import { buildCorsHeaders } from '../../../lib/securityHeaders';
+import { classifyAppError, createApiErrorResponse } from '../../../lib/errorHandling';
+
+const CORS_METHODS = 'POST, OPTIONS';
+
+function buildJsonHeaders(requestOrigin?: string | null, requestId?: string) {
+  const headers = { ...buildCorsHeaders(requestOrigin), 'Access-Control-Allow-Methods': CORS_METHODS } as Record<string, string>;
+  if (requestId) {
+    headers['x-request-id'] = requestId;
+  }
+  return headers;
+}
+
+function buildErrorResponse(message: string, status: number, code: string, requestOrigin?: string | null, requestId?: string, details?: unknown) {
+  return NextResponse.json(createApiErrorResponse(message, { status, code, requestId, details }), {
+    status,
+    headers: buildJsonHeaders(requestOrigin, requestId),
+  });
+}
+
+export async function OPTIONS(req: Request) {
+  logger.info('Chat OPTIONS preflight', {
+    origin: req.headers.get('origin'),
+  });
+  return new NextResponse(null, {
+    status: 204,
+    headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS },
+  });
+}
+
+export async function POST(req: Request) {
+  logger.info('Chat POST received', { origin: req.headers.get('origin') });
+  let requestId = buildAIRequestId('chat');
+  try {
+    const user = await authenticateAIRequest(req);
+    const userId = user.id;
+    logger.info('Authenticated chat user', { userId });
+
+    const clientIp = getClientIp(req);
+    await enforceAIGatewayRateLimit(userId, clientIp);
+
+    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown } | null = null;
+    try {
+      body = (await req.json()) as { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown };
+    } catch {
+      return buildErrorResponse('Invalid JSON body', 400, 'validation_error', req.headers.get('origin'), requestId);
+    }
+
+    const message = typeof body?.message === 'string' ? body.message.trim() : '';
+    const image = body?.image;
+    requestId = typeof body?.requestId === 'string' && body.requestId.trim()
+      ? body.requestId.trim()
+      : requestId;
+
+    if (!message && !image) {
+      return buildErrorResponse('Invalid input: message or image is required', 400, 'validation_error', req.headers.get('origin'), requestId);
+    }
+
+    if (image !== undefined && image !== null && typeof image !== 'object') {
+      return buildErrorResponse('Invalid input: image payload is malformed', 400, 'validation_error', req.headers.get('origin'), requestId);
+    }
+
+    const imagePayload = image && typeof image === 'object'
+      ? image as { data?: unknown; mimeType?: unknown; uri?: unknown }
+      : null;
+
+    let conversationId = typeof body?.conversationId === 'string' ? body.conversationId : undefined;
+    if (conversationId && !(await validateConversationOwnership(conversationId, userId))) {
+      return buildErrorResponse('Forbidden', 403, 'authorization_failed', req.headers.get('origin'), requestId);
+    }
+
+    if (!conversationId) {
+      const conv = await getOrCreateLatestConversation(userId);
+      conversationId = conv.id;
+    }
+    logger.info('Chat conversation selected', { userId, conversationId });
+
+    const historyForAI = await getConversationHistoryForAI(conversationId);
+    const userText = message || (imagePayload ? 'Please analyze the attached image and explain it clearly as a tutor.' : '');
+
+    // Validate image if provided
+    let validatedImage: { data: string; mimeType: string; uri?: string | null } | null = null;
+    if (imagePayload) {
+      if (typeof imagePayload.data !== 'string' || typeof imagePayload.mimeType !== 'string') {
+        return buildErrorResponse('Invalid image: data and mimeType are required', 400, 'validation_error', req.headers.get('origin'), requestId);
+      }
+      try {
+        const imageBuffer = Buffer.from(imagePayload.data, 'base64');
+        const validated = validateImageBuffer(imageBuffer, imagePayload.mimeType);
+        validatedImage = {
+          data: imagePayload.data,
+          mimeType: validated.mimeType,
+          uri: typeof imagePayload.uri === 'string' ? imagePayload.uri : undefined,
+        };
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : 'Image validation failed';
+        return buildErrorResponse(`Invalid image: ${errMsg}`, 400, 'file_upload_error', req.headers.get('origin'), requestId);
+      }
+    }
+
+    const result = await executeAIRequest({
+      user,
+      clientIp,
+      feature: 'chat',
+      provider: 'Gemini',
+      amount: 1,
+      requestId,
+      metadata: { conversationId },
+      pending: true,
+      securityInput: userText,
+      securityContext: { conversationId, hasImage: Boolean(validatedImage) },
+      callback: async ({ billingDecision, sanitizedInput }) => {
+        const sanitizedText = sanitizedInput ?? userText;
+        const userEntry: GeminiMessage = { role: 'user', parts: [{ text: sanitizedText }] };
+        const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
+
+        if (validatedImage) {
+          contents.push({
+            type: 'image',
+            data: validatedImage.data,
+            mime_type: validatedImage.mimeType,
+            uri: validatedImage.uri ?? undefined,
+          });
+        }
+
+        const modelToUse = billingDecision.modelUsed ?? undefined;
+        return askGemini(contents, modelToUse);
+      },
+    });
+
+    try {
+      const savedUserText = message || (imagePayload ? 'Image attached' : '');
+      if (message) {
+        await setConversationTitleIfMissing(conversationId, message);
+      }
+      const assistantText = typeof result.result === 'string' ? result.result : String(result.result ?? '');
+      await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+      await addMessageToConversation(conversationId, 'assistant', assistantText, userId, { requestId });
+    } catch (dbErr) {
+      logger.error('Failed to save chat to DB', { error: String(dbErr) });
+    }
+
+    return NextResponse.json({ result: result.result, conversationId }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+  } catch (err: unknown) {
+    if (err instanceof AIRequestGatewayError) {
+      return NextResponse.json(err.body, { status: err.status, headers: buildJsonHeaders(req.headers.get('origin')) });
+    }
+
+    const appError = classifyAppError(err, { status: typeof err === 'object' && err !== null && 'status' in err && typeof (err as { status?: unknown }).status === 'number' ? (err as { status?: number }).status : undefined, source: 'chat', requestId });
+    const message = appError.message;
+    const status = appError.httpStatus;
+    logger.error('Chat route error', { error: { message, status, code: appError.code }, requestId });
+    return buildErrorResponse(message, status, appError.code, req.headers.get('origin'), requestId);
+  }
+}

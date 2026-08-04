@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BillingPlan {
+  FREE
+  PRO
+  PREMIUM
+}
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  password      String
+  name          String?
+  createdAt     DateTime @default(now())
+  conversations Conversation[]
+  wallet        UserWallet?
+  usageLogs     UsageLog[]
+}
+
+model UserWallet {
+  id                String      @id @default(cuid())
+  userId            String      @unique
+  user              User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId            String
+  plan              Plan        @relation(fields: [planId], references: [id])
+  learningCredits   Int         @default(0)
+  liveTutorCredits  Int         @default(0)
+  subscriptionStatus String     @default("active")
+  renewalDate       DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+}
+
+model Plan {
+  id               String   @id @default(cuid())
+  name             String   @unique
+  price            Float    @default(0)
+  monthlyMessages  Int?
+  monthlyImages    Int?
+  liveTutorMinutes Int?
+  features         Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  UserWallets      UserWallet[]
+}
+
+model UsageLog {
+  id              String   @id @default(cuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  feature         String
+  provider        String
+  requestId       String?
+  tokensInput     Int      @default(0)
+  tokensOutput    Int      @default(0)
+  secondsUsed     Int      @default(0)
+  providerCostUSD Float    @default(0)
+  userChargeUSD   Float    @default(0)
+  profitUSD       Float    @default(0)
+  createdAt       DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([feature, provider])
+}
+
+model PricingConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       Float
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Conversation {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String?
+  messages  ConversationMessage[]
+  pinned    Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model ConversationMessage {
+  id             String   @id @default(cuid())
+  conversationId String
+  userId         String   @default("")
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           String   @default("user") // "user" or "assistant"
+  content        String   @default("")
+  text           String?
+  feedback       String?
+  saved          Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@index([conversationId, createdAt])
+  @@index([userId])
+}
